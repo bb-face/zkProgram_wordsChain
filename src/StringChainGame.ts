@@ -11,35 +11,40 @@ import {
 } from 'o1js';
 
 // Struct to hold a word and its verification status
+class SplitWord extends Struct({
+  word: CircuitString,
+  prefix: CircuitString,
+  lastChar: CircuitString,
+}) {
+  verify(): Bool {
+    // Check lastChar is single character
+    const isOneChar = this.lastChar.length().equals(1);
+
+    // Verify prefix + lastChar = word using hash comparison
+    const isValidSplit = this.prefix
+      .append(this.lastChar)
+      .hash()
+      .equals(this.word.hash());
+
+    return Bool.and(isOneChar, isValidSplit);
+  }
+}
+
 class WordChain extends Struct({
-  currentWord: CircuitString,
-  currentWordPrefix: CircuitString,
-  currentWordLastChar: CircuitString,
+  currentWord: SplitWord,
   chainLength: Field,
   isValid: Bool,
 }) {
-  // Helper method to check if two words can be chained
+  static canChainWords(word1: SplitWord, word2: SplitWord): Bool {
+    // Verify both splits are valid
+    const validSplits = Bool.and(word1.verify(), word2.verify());
 
-  //    We can't use toString:
-
-  //    1. Compiling WordChainVerifier...
-  //    Error: x.toString() was called on a variable field element `x` in provable code.
-  //    This is not supported, because variables represent an abstract computation,
-  //    which only carries actual values during proving, but not during compiling.
-
-  static canChainWords(
-    word1: CircuitString,
-    word1Prefix: CircuitString,
-    word1LastChar: CircuitString,
-    word2: CircuitString
-  ): Bool {
-    word1LastChar.length().assertEquals(1);
-
-    word1Prefix.append(word1LastChar).hash().assertEquals(word1.hash());
-
-    return CircuitString.toFields(word1LastChar)[0].equals(
-      CircuitString.toFields(word2)[0]
+    // Compare last char of word1 with first char of word2
+    const canChain = CircuitString.toFields(word1.lastChar)[0].equals(
+      CircuitString.toFields(word2.word)[0]
     );
+
+    return Bool.and(validSplits, canChain);
   }
 
   // Convert WordChain to a single Field using Poseidon hash
@@ -56,66 +61,46 @@ const WordChainVerifier = ZkProgram({
   methods: {
     // Start a new chain with a single word
     init: {
-      privateInputs: [CircuitString, CircuitString, CircuitString],
-      async method(
-        state: Field,
-        word: CircuitString,
-        wordPrefix: CircuitString,
-        wordLastChar: CircuitString
-      ) {
+      privateInputs: [SplitWord],
+      async method(state: Field, word: SplitWord) {
+        word.verify().assertTrue();
+
         const chain = new WordChain({
           currentWord: word,
-          currentWordPrefix: wordPrefix,
-          currentWordLastChar: wordLastChar,
           chainLength: Field(1),
           isValid: Bool(true),
         });
 
-        const stateHash = chain.toHash();
-
-        state.assertEquals(stateHash);
+        state.assertEquals(chain.toHash());
       },
     },
 
     // Add a new word to the chain
     addWord: {
-      privateInputs: [
-        SelfProof,
-        CircuitString,
-        CircuitString,
-        CircuitString,
-        WordChain,
-      ],
+      privateInputs: [SelfProof, SplitWord, WordChain],
       async method(
         newState: Field,
         earlierProof: SelfProof<Field, void>,
-        nextWord: CircuitString,
-        nextWordPrefix: CircuitString,
-        nextWordLastChar: CircuitString,
+        nextWord: SplitWord,
         previousChain: WordChain
       ) {
         earlierProof.verify();
-
         previousChain.toHash().assertEquals(earlierProof.publicInput);
+
+        nextWord.verify().assertTrue();
 
         const canChain = WordChain.canChainWords(
           previousChain.currentWord,
-          previousChain.currentWordPrefix,
-          previousChain.currentWordLastChar,
           nextWord
         );
 
         const newChain = new WordChain({
           currentWord: nextWord,
-          currentWordPrefix: nextWordPrefix,
-          currentWordLastChar: nextWordLastChar,
           chainLength: previousChain.chainLength.add(1),
           isValid: Bool.and(previousChain.isValid, canChain),
         });
 
-        const stateHash = newChain.toHash();
-
-        newState.assertEquals(stateHash);
+        newState.assertEquals(newChain.toHash());
       },
     },
 
@@ -144,16 +129,12 @@ const WordChainVerifier = ZkProgram({
         // Check if chains can be connected
         const chainsCanConnect = WordChain.canChainWords(
           chain1.currentWord,
-          chain1.currentWordPrefix,
-          chain1.currentWordLastChar,
           chain2.currentWord
         );
 
         // Create merged chain
         const mergedChain = new WordChain({
           currentWord: chain2.currentWord,
-          currentWordPrefix: chain2.currentWordPrefix,
-          currentWordLastChar: chain2.currentWordLastChar,
           chainLength: chain1.chainLength.add(chain2.chainLength),
           isValid: Bool.and(
             Bool.and(chain1.isValid, chain2.isValid),
@@ -179,36 +160,39 @@ async function main() {
   console.log('1. Compiling WordChainVerifier...');
   const { verificationKey } = await WordChainVerifier.compile();
 
+  console.log('-- before wordq1');
   // Test word chain: cat -> tree -> elephant
-  const word1 = CircuitString.fromString('cat');
-  const word1Prefix = CircuitString.fromString('ca');
-  const word1LastChar = CircuitString.fromString('t');
-  const word2 = CircuitString.fromString('tree');
-  const word2Prefix = CircuitString.fromString('tre');
-  const word2LastChar = CircuitString.fromString('e');
-  const word3 = CircuitString.fromString('elephant');
-  const word3Prefix = CircuitString.fromString('elephan');
-  const word3LastChar = CircuitString.fromString('t');
+  const word1 = new SplitWord({
+    word: CircuitString.fromString('cat'),
+    prefix: CircuitString.fromString('ca'),
+    lastChar: CircuitString.fromString('t'),
+  });
+
+  console.log('-- before word2');
+  const word2 = new SplitWord({
+    word: CircuitString.fromString('tree'),
+    prefix: CircuitString.fromString('tre'),
+    lastChar: CircuitString.fromString('e'),
+  });
+
+  const word3 = new SplitWord({
+    word: CircuitString.fromString('elephant'),
+    prefix: CircuitString.fromString('elephan'),
+    lastChar: CircuitString.fromString('t'),
+  });
 
   console.log('\n2. Creating and verifying word chain...');
 
   // Initialize chain with first word
   const chain1 = new WordChain({
     currentWord: word1,
-    currentWordPrefix: word1Prefix,
-    currentWordLastChar: word1LastChar,
     chainLength: Field(1),
     isValid: Bool(true),
   });
 
   const state1 = chain1.toHash();
 
-  const { proof: proof1 } = await WordChainVerifier.init(
-    state1,
-    word1,
-    word1Prefix,
-    word1LastChar
-  );
+  const { proof: proof1 } = await WordChainVerifier.init(state1, word1);
 
   try {
     await verify(proof1.toJSON(), verificationKey);
@@ -217,13 +201,11 @@ async function main() {
     console.error('proof 1 verification failed:', error);
   }
 
-  const canChain12 = canChainWords(word1, word2);
+  const canChain12 = canChainWords(word1.word, word2.word);
 
   // Add second word
   const chain2 = new WordChain({
     currentWord: word2,
-    currentWordPrefix: word2Prefix,
-    currentWordLastChar: word2LastChar,
     chainLength: chain1.chainLength.add(1),
     isValid: Bool.and(chain1.isValid, Bool(canChain12)),
   });
@@ -234,8 +216,6 @@ async function main() {
     state2,
     proof1,
     word2,
-    word2Prefix,
-    word2LastChar,
     chain1
   );
 
@@ -246,13 +226,11 @@ async function main() {
     console.error('earlierProof verification failed:', error);
   }
 
-  const canChain23 = canChainWords(word2, word3);
+  const canChain23 = canChainWords(word2.word, word3.word);
 
   // Store the second chain state
   const chain3 = new WordChain({
     currentWord: word3,
-    currentWordPrefix: word3Prefix,
-    currentWordLastChar: word3LastChar,
     chainLength: chain2.chainLength.add(1),
     isValid: Bool.and(chain2.isValid, Bool(canChain23)),
   });
@@ -264,8 +242,6 @@ async function main() {
     state3,
     proof2,
     word3,
-    word3Prefix,
-    word3LastChar,
     chain2
   );
 
@@ -277,17 +253,20 @@ async function main() {
   }
 
   // Create a second chain to demonstrate merging
-  const word4 = CircuitString.fromString('trunt');
-  const word4prefix = CircuitString.fromString('trun');
-  const word4LastChar = CircuitString.fromString('t');
-  const word5 = CircuitString.fromString('tking');
-  const word5Prefix = CircuitString.fromString('tkin');
-  const word5LastChar = CircuitString.fromString('g');
+  const word4 = new SplitWord({
+    word: CircuitString.fromString('trunt'),
+    prefix: CircuitString.fromString('trun'),
+    lastChar: CircuitString.fromString('t'),
+  });
+
+  const word5 = new SplitWord({
+    word: CircuitString.fromString('tking'),
+    prefix: CircuitString.fromString('tkin'),
+    lastChar: CircuitString.fromString('g'),
+  });
 
   const secondChain1 = new WordChain({
     currentWord: word4,
-    currentWordPrefix: word4prefix,
-    currentWordLastChar: word4LastChar,
     chainLength: Field(1),
     isValid: Bool(true),
   });
@@ -296,9 +275,7 @@ async function main() {
 
   const { proof: proof4 } = await WordChainVerifier.init(
     secondChain1Hash,
-    word4,
-    word4prefix,
-    word4LastChar
+    word4
   );
 
   try {
@@ -308,12 +285,10 @@ async function main() {
     console.error('second chain 1 verification failed:', error);
   }
 
-  const canChain45 = canChainWords(word4, word5);
+  const canChain45 = canChainWords(word4.word, word5.word);
 
   const secondChain2 = new WordChain({
     currentWord: word5,
-    currentWordPrefix: word5Prefix,
-    currentWordLastChar: word5LastChar,
     chainLength: Field(2),
     isValid: Bool.and(secondChain1.isValid, Bool(canChain45)),
   });
@@ -324,8 +299,6 @@ async function main() {
     secondChain2Hash,
     proof4,
     word5,
-    word5Prefix,
-    word5LastChar,
     secondChain1
   );
 
@@ -342,8 +315,6 @@ async function main() {
 
   const finalChainSum = new WordChain({
     currentWord: finalChain2.currentWord,
-    currentWordPrefix: finalChain2.currentWordPrefix,
-    currentWordLastChar: finalChain2.currentWordLastChar,
     chainLength: finalChain1.chainLength.add(finalChain2.chainLength),
     isValid: Bool.and(finalChain1.isValid, finalChain2.isValid),
   });
